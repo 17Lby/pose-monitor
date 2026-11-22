@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>基于轻量化姿态估计的学生坐姿智能监测与干预系统</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { background:#f4f7fa; font-family:"Microsoft Yahei",sans-serif; text-align:center; padding:12px; }
+        h2 { margin-bottom:12px; }
+        #canvasWrap { width:100%; max-width:640px; margin:0 auto; border-radius:12px; overflow:hidden; }
+        canvas { width:100%; display:block; transform:scaleX(-1); }
+        #tip { margin-top:14px; font-size:22px; font-weight:bold; }
+        #debug { margin-top:8px; font-size:13px; color:#555; }
+        #recordInfo, #calibTip { margin-top:10px; font-size:16px; }
+        button { margin:6px; padding:12px 16px; font-size:16px; border:none; border-radius:10px; background:#4C7A5A; color:#fff; cursor:pointer; }
+        .audio-on { background:#27ae60 !important; }
+        .normal { color:#27ae60; }
+        .warn { color:#e74c3c; }
+        .info { color:#3498db; }
+    </style>
+</head>
+<body>
+    <h2>基于轻量化姿态估计的学生坐姿智能监测与干预系统</h2>
+    <div id="canvasWrap">
+        <canvas id="canvas" width="480" height="360"></canvas>
+    </div>
+    <div id="calibTip">【校准】保持端正姿态等待稳定</div>
+    <br>
+    <button id="monitorBtn">开始监测</button>
+    <button id="calibBtn">校准基准姿态</button>
+    <button id="audioBtn">开启音频提醒</button>
+    <div id="tip" class="info">点击【开始监测】启动检测</div>
+    <div id="debug"></div>
+    <div id="recordInfo"></div>
+
+    <script src="https://unpkg.com/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+    <script src="https://unpkg.com/@tensorflow-models/pose-detection@2.1.0/dist/pose-detection.min.js"></script>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const tip = document.getElementById('tip');
+        const debug = document.getElementById('debug');
+        const recordInfo = document.getElementById('recordInfo');
+        const calibTip = document.getElementById('calibTip');
+        const calibBtn = document.getElementById('calibBtn');
+        const audioBtn = document.getElementById('audioBtn');
+        const monitorBtn = document.getElementById('monitorBtn');
+
+        let video, detector;
+        let monitoring = false;   // 总开关：是否正在正式检测
+        let initialized = false;  // 模型与摄像头是否已初始化
+        let audioEnabled = false;
+        let audioCtx = null;
+        let lastInferTime = 0;
+        const INFER_INTERVAL = 180;
+
+        const LIMIT_DOWN = 0.12;
+        const LIMIT_UP = 0.09;
+        const TILT_DEG = 11;
+        const SH_DEG = 10;
+        const SIDE_TURN = 0.12;
+        const WIDTH_RATIO = 0.80; // 身体侧转后双肩投影宽度相对基准收缩到此比例以下，判为侧身
+        const BUFFER = 8;
+        const TRIGGER_TIME = 3000;
+        const UNSTABLE_INTERVAL = 2500;
+        const ALERT_REPEAT = 10000; // 同一不良姿态持续时，每 10 秒重复提醒一次
+
+        let base = null;
+        let featBuf = [];
+        let badPoseStart = null;
+        let warned = false;
+        let lastAlertAt = 0;
+        let lastUnstableBeep = 0;
+
+        const todayKey = "poseRecord_" + new Date().toLocaleDateString();
+        let record = JSON.parse(localStorage.getItem(todayKey) || '{"count":0,"list":[]}');
+
+        const NOSE = 0, LEFT_EYE = 1, RIGHT_EYE = 2, LEFT_SHOULDER = 5, RIGHT_SHOULDER = 6;
+        const LEFT_HIP = 11, RIGHT_HIP = 12;
+        const TORSO_TURN = 0.14; // 肩中点相对髋中点水平错位超此值，判为躯干侧转
+
+        function refreshRecord() { recordInfo.innerText = `今日提醒次数：${record.count}`; }
+        refreshRecord();
+
+        function saveRecord(typeText) {
+            record.count += 1;
+            record.list.push({ time: new Date().toLocaleTimeString(), type: typeText });
+            localStorage.setItem(todayKey, JSON.stringify(record));
+            refreshRecord();
+        }
+
+        // 播放前先确保音频上下文处于运行状态，避免被浏览器挂起导致静默
+        async function ensureCtx() {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+            return audioCtx.state === 'running';
+        }
+
+        async function playWarningBeep() {
+            if (!audioEnabled) return;
+            try {
+                const ok = await ensureCtx();
+                if (!ok) return;
+                const now = audioCtx.currentTime;
+                [0, 0.18].forEach(off => {
+                    const osc = audioCtx.createOscillator();
+                    const gain = audioCtx.createGain();
+                    osc.connect(gain); gain.connect(audioCtx.destination);
+                    osc.type = 'square'; osc.frequency.value = 800;
+                    gain.gain.setValueAtTime(0.0001, now + off);
+                    gain.gain.exponentialRampToValueAtTime(0.3, now + off + 0.02);
+                    gain.gain.exponentialRampToValueAtTime(0.0001, now + off + 0.15);
+                    osc.start(now + off); osc.stop(now + off + 0.18);
+                });
+            } catch (e) { console.warn('提示音失败', e); }
+        }
+
+        async function playUnstableBeep() {
+            if (!audioEnabled) return;
+            const now = Date.now();
+            if (now - lastUnstableBeep < UNSTABLE_INTERVAL) return;
+            lastUnstableBeep = now;
+            try {
+                const ok = await ensureCtx();
+                if (!ok) return;
+                const t = audioCtx.currentTime;
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.connect(gain); gain.connect(audioCtx.destination);
+                osc.type = 'square'; osc.frequency.value = 400;
+                gain.gain.setValueAtTime(0.0001, t);
+                gain.gain.exponentialRampToValueAtTime(0.3, t + 0.02);
+                gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+                osc.start(t); osc.stop(t + 0.22);
+            } catch (e) { console.warn(e); }
+        }
+
+        function normAngle(deg) {
+            while (deg > 90) deg -= 180;
+            while (deg < -90) deg += 180;
+            return deg;
+        }
+
+        function computeFeatures(nose, lEye, rEye, lSh, rSh, lHip, rHip, hipOk) {
+            const shMid = { x:(lSh.x+rSh.x)/2, y:(lSh.y+rSh.y)/2 };
+            const shoulderW = Math.hypot(rSh.x-lSh.x, rSh.y-lSh.y);
+            const shAngle = normAngle(Math.atan2(rSh.y-lSh.y, rSh.x-lSh.x)*180/Math.PI);
+            const pitchRel = (nose.y-shMid.y)/shoulderW;
+            const sideRel = (nose.x-shMid.x)/shoulderW;
+            const headTilt = normAngle(Math.atan2(rEye.y-lEye.y, rEye.x-lEye.x)*180/Math.PI);
+            // 躯干朝向：肩中点相对髋中点的水平错位；髋点不可靠时退化为头肩偏移，避免凭空报错
+            let torsoRel = sideRel;
+            if (hipOk) {
+                const hipMidX = (lHip.x+rHip.x)/2;
+                torsoRel = (shMid.x-hipMidX)/shoulderW;
+            }
+            return { pitchRel, sideRel, headTilt, shAngle, shoulderW, torsoRel };
+        }
+
+        function avgBuf(key) {
+            if (!featBuf.length) return 0;
+            let s = 0; for (let f of featBuf) s += f[key]; return s/featBuf.length;
+        }
+
+        calibBtn.onclick = () => {
+            if (featBuf.length < 6) { calibTip.innerText = "数据不足！保持端正多等一会儿"; return; }
+            base = {
+                pitchRel: avgBuf("pitchRel"),
+                sideRel: avgBuf("sideRel"),
+                headTilt: avgBuf("headTilt"),
+                shAngle: avgBuf("shAngle"),
+                shoulderW: avgBuf("shoulderW"),
+                torsoRel: avgBuf("torsoRel")
+            };
+            calibTip.innerText = "✅ 基准校准完成！";
+        };
+
+        monitorBtn.onclick = async () => {
+            if (!initialized) {
+                await run();
+                initialized = true;
+            }
+            monitoring = !monitoring;
+            if (monitoring) {
+                monitorBtn.innerText = "暂停监测";
+                tip.innerText = "监测中，请保持端正";
+                tip.className = "info";
+            } else {
+                monitorBtn.innerText = "开始监测";
+                badPoseStart = null; warned = false; lastAlertAt = 0;
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                tip.innerText = "⏸ 已暂停监测";
+                tip.className = "info";
+            }
+        };
+
+        audioBtn.onclick = async () => {
+            if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            if (audioCtx.state === 'suspended') await audioCtx.resume();
+            if (audioEnabled) {
+                audioEnabled = false;
+                audioBtn.innerText = "开启音频提醒";
+                audioBtn.classList.remove("audio-on");
+            } else {
+                audioEnabled = true;
+                audioBtn.innerText = "音频已开启 ✅";
+                audioBtn.classList.add("audio-on");
+                playWarningBeep();
+            }
+        };
+
+        async function run() {
+            try {
+                tip.innerText = "初始化 TF 后端...";
+                await tf.ready();
+                await tf.setBackend('webgl');
+                if (typeof poseDetection === "undefined") {
+                    tip.innerText = "❌ 模型库加载失败！";
+                    tip.className = "warn"; return;
+                }
+                tip.innerText = "请求摄像头权限...";
+                const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:480, height:360, facingMode:"user" } });
+                video = document.createElement('video');
+                video.width = 480; video.height = 360;
+                video.srcObject = stream; video.autoplay = true; video.playsInline = true;
+                await video.play();
+
+                tip.innerText = "加载 MoveNet 模型...";
+                detector = await poseDetection.createDetector(
+                    poseDetection.SupportedModels.MoveNet,
+                    { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
+                );
+                tip.innerText = "模型已就绪，点击【开始监测】";
+                loop();
+            } catch (err) {
+                tip.innerText = "❌ " + err.message;
+                tip.className = "warn";
+                console.error(err);
+            }
+        }
+
+        async function loop() {
+            requestAnimationFrame(loop);
+            if (!monitoring || !video || !detector) return;
+
+            const now = Date.now();
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            if (now - lastInferTime < INFER_INTERVAL) return;
+            lastInferTime = now;
+
+            const poses = await detector.estimatePoses(video);
+            if (!poses || poses.length === 0) {
+                badPoseStart = null; warned = false;
+                tip.innerText = "⚠️ 未检测到人体"; tip.className = "warn";
+                playUnstableBeep(); return;
+            }
+            const kp = poses[0].keypoints;
+            const nose = kp[NOSE], lEye = kp[LEFT_EYE], rEye = kp[RIGHT_EYE];
+            const lSh = kp[LEFT_SHOULDER], rSh = kp[RIGHT_SHOULDER];
+            const lHip = kp[LEFT_HIP], rHip = kp[RIGHT_HIP];
+
+            const faceOk = nose.score>0.25 && lEye.score>0.25 && rEye.score>0.25;
+            const shOk = lSh.score>0.2 && rSh.score>0.2;
+            const hipOk = lHip.score>0.2 && rHip.score>0.2;
+
+            if (!faceOk || !shOk) {
+                badPoseStart = null; warned = false;
+                tip.innerText = "⚠️ 识别不稳定，请摆正身体"; tip.className = "warn";
+                playUnstableBeep(); return;
+            }
+
+            const feat = computeFeatures(nose, lEye, rEye, lSh, rSh, lHip, rHip, hipOk);
+            featBuf.push(feat);
+            if (featBuf.length > BUFFER) featBuf.shift();
+            const s = {
+                pitchRel: avgBuf("pitchRel"),
+                sideRel: avgBuf("sideRel"),
+                headTilt: avgBuf("headTilt"),
+                shAngle: avgBuf("shAngle"),
+                shoulderW: avgBuf("shoulderW"),
+                torsoRel: avgBuf("torsoRel")
+            };
+
+            if (!base) {
+                tip.innerText = "等待校准，保持端正"; tip.className = "info";
+                debug.innerText = `pitch:${s.pitchRel.toFixed(2)}`; return;
+            }
+
+            const dPitch = s.pitchRel-base.pitchRel;
+            const dSide = s.sideRel-base.sideRel;
+            const dTilt = s.headTilt-base.headTilt;
+            const dSh = s.shAngle-base.shAngle;
+            const dTorso = s.torsoRel-base.torsoRel;
+            const widthRatio = base.shoulderW > 0 ? s.shoulderW/base.shoulderW : 1;
+
+            const bodySide = widthRatio < WIDTH_RATIO || Math.abs(dTorso) > TORSO_TURN;
+            const warns = [];
+            if (dPitch > LIMIT_DOWN) warns.push("低头驼背");
+            if (dPitch < -LIMIT_UP) warns.push("抬头过高");
+            if (Math.abs(dTilt) > TILT_DEG) warns.push("歪头");
+            // 侧身时双肩一前一后、连线角度天然变大，此时斜肩不可靠，豁免斜肩判定
+            if (Math.abs(dSh) > SH_DEG && !bodySide) warns.push("斜肩");
+            if (bodySide) warns.push("侧身");
+            if (Math.abs(dSide) > SIDE_TURN) warns.push("转头");
+
+            if (warns.length > 0) {
+                if (!badPoseStart) badPoseStart = now;
+                const dur = now - badPoseStart;
+                if (dur >= TRIGGER_TIME) {
+                    // 首次触发：响铃并记录
+                    if (!warned) {
+                        tip.innerText = "⚠️ " + warns.join("、"); tip.className = "warn";
+                        saveRecord(warns.join("、"));
+                        playWarningBeep();
+                        warned = true; lastAlertAt = now;
+                    } else if (now - lastAlertAt > ALERT_REPEAT) {
+                        // 持续不良姿态：每隔一段时间重复提醒，避免只响一次后就静默
+                        playWarningBeep();
+                        lastAlertAt = now;
+                    }
+                } else {
+                    tip.innerText = "监测中..."; tip.className = "info";
+                }
+            } else {
+                badPoseStart = null; warned = false; lastAlertAt = 0;
+                tip.innerText = "✅ 坐姿正常，请保持！"; tip.className = "normal";
+            }
+            debug.innerText = `Δ俯仰:${dPitch.toFixed(2)} Δ侧身:${dSide.toFixed(2)} Δ躯干:${dTorso.toFixed(2)} Δ歪头:${dTilt.toFixed(1)}° Δ斜肩:${dSh.toFixed(1)}° 肩宽比:${widthRatio.toFixed(2)}`;
+        }
+
+        // 模型与摄像头在点击【开始监测】时再初始化，不自动启动
+    </script>
+</body>
+</html>
